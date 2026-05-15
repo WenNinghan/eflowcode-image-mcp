@@ -33,6 +33,7 @@ _TRUST_ENV = (
     or os.environ.get("EF_USE_SHELL_PROXY")
     or ""
 ).strip().lower() in {"1", "true", "yes"}
+_USE_STREAM = (os.environ.get("EFLOWCODE_STREAM") or os.environ.get("EF_STREAM") or "1").strip().lower() not in {"0", "false", "no"}
 
 _SAVE_ROOT = Path(
     os.environ.get("EFLOWCODE_SAVE_DIR_ROOT")
@@ -215,11 +216,76 @@ def _extract_image_results(resp: dict[str, Any]) -> list[str]:
     return results
 
 
+def _merge_response_event(state: dict[str, Any], event: dict[str, Any]) -> None:
+    event_type = event.get("type")
+    if event_type == "response.completed" and isinstance(event.get("response"), dict):
+        state["response"] = event["response"]
+        return
+    if event_type == "response.failed" and isinstance(event.get("response"), dict):
+        state["response"] = event["response"]
+        return
+    if event_type == "response.output_item.done" and isinstance(event.get("item"), dict):
+        state.setdefault("output", []).append(event["item"])
+        return
+    if event_type == "response.image_generation_call.completed" and isinstance(event.get("result"), str):
+        state.setdefault("output", []).append({
+            "type": "image_generation_call",
+            "result": event["result"],
+        })
+        return
+    if event_type == "response.image_generation_call.partial_image" and isinstance(event.get("partial_image_b64"), str):
+        state["last_partial_image_b64"] = event["partial_image_b64"]
+
+
+async def _post_responses_stream(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    stream_body = dict(body)
+    stream_body["stream"] = True
+    stream_headers = dict(headers)
+    stream_headers["Accept"] = "text/event-stream"
+    state: dict[str, Any] = {"output": [], "_stream_events": 0}
+    async with client.stream(
+        "POST",
+        f"{DEFAULT_BASEURL}/responses",
+        headers=stream_headers,
+        json=stream_body,
+        timeout=600.0,
+    ) as response:
+        if not 200 <= response.status_code < 300:
+            text = (await response.aread()).decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {response.status_code}: {text[:2000]}")
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            state["_stream_events"] += 1
+            _merge_response_event(state, event)
+    if "response" in state and isinstance(state["response"], dict):
+        merged = state["response"]
+        if not merged.get("output") and state.get("output"):
+            merged["output"] = state["output"]
+        merged["_stream_events"] = state["_stream_events"]
+        return merged
+    return state
+
+
 def _response_summary(resp: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": resp.get("id"),
         "status": resp.get("status"),
         "model": resp.get("model"),
+        "stream_events": resp.get("_stream_events"),
+        "stream_fallback_error": resp.get("_stream_fallback_error"),
         "output_types": [
             item.get("type")
             for item in resp.get("output", [])
@@ -285,14 +351,27 @@ async def _responses_image_request(
         "Accept": "application/json",
     }
     async with httpx.AsyncClient(timeout=600.0, trust_env=_TRUST_ENV) as client:
-        response = await client.post(f"{DEFAULT_BASEURL}/responses", headers=headers, json=body)
-
-    try:
-        payload = response.json()
-    except json.JSONDecodeError:
-        payload = {"raw_text": response.text[:2000]}
-    if not 200 <= response.status_code < 300:
-        raise RuntimeError(f"HTTP {response.status_code}: {json.dumps(payload, ensure_ascii=False)[:2000]}")
+        if _USE_STREAM:
+            try:
+                payload = await _post_responses_stream(client, headers, body)
+            except Exception as stream_error:
+                response = await client.post(f"{DEFAULT_BASEURL}/responses", headers=headers, json=body)
+                try:
+                    payload = response.json()
+                except json.JSONDecodeError:
+                    payload = {"raw_text": response.text[:2000]}
+                if isinstance(payload, dict):
+                    payload["_stream_fallback_error"] = str(stream_error)
+                if not 200 <= response.status_code < 300:
+                    raise RuntimeError(f"HTTP {response.status_code}: {json.dumps(payload, ensure_ascii=False)[:2000]}")
+        else:
+            response = await client.post(f"{DEFAULT_BASEURL}/responses", headers=headers, json=body)
+            try:
+                payload = response.json()
+            except json.JSONDecodeError:
+                payload = {"raw_text": response.text[:2000]}
+            if not 200 <= response.status_code < 300:
+                raise RuntimeError(f"HTTP {response.status_code}: {json.dumps(payload, ensure_ascii=False)[:2000]}")
 
     results = _extract_image_results(payload if isinstance(payload, dict) else {})
     return results, payload if isinstance(payload, dict) else {"raw": payload}
