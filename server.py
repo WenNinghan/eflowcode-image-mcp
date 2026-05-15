@@ -6,6 +6,8 @@ import base64
 import json
 import os
 import re
+import traceback
+import uuid
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,16 +26,8 @@ API_KEY = (
     or os.environ.get("EF_API_KEY", "")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MODEL = (
-    os.environ.get("EFLOWCODE_MODEL")
-    or os.environ.get("EF_MODEL")
-    or "gpt-5.5"
-)
-PROMPT_PREFIX = (
-    os.environ.get("EFLOWCODE_PROMPT_PREFIX")
-    or os.environ.get("EF_PROMPT_PREFIX")
-    or "不改写："
-)
+DEFAULT_MODEL = os.environ.get("EFLOWCODE_MODEL") or os.environ.get("EF_MODEL") or "gpt-5.5"
+PROMPT_PREFIX = os.environ.get("EFLOWCODE_PROMPT_PREFIX") or os.environ.get("EF_PROMPT_PREFIX") or "不改写："
 _TRUST_ENV = (
     os.environ.get("EFLOWCODE_USE_SHELL_PROXY")
     or os.environ.get("EF_USE_SHELL_PROXY")
@@ -61,6 +55,7 @@ MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 _SAFE_BASENAME_RE = re.compile(r"^[A-Za-z0-9_\-.]+$")
 
 mcp = FastMCP("eflowcode-image")
+_JOBS: dict[str, dict[str, Any]] = {}
 
 
 @dataclass
@@ -325,6 +320,49 @@ def _validate_common(
     return cleaned_size, out_dir, safe_stem, None
 
 
+def _start_job(kind: str, params: dict[str, Any]) -> dict[str, Any]:
+    job_id = uuid.uuid4().hex
+    _JOBS[job_id] = {
+        "id": job_id,
+        "kind": kind,
+        "status": "running",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "params": {k: v for k, v in params.items() if k != "api_key"},
+        "result": None,
+        "error": None,
+    }
+
+    async def _runner() -> None:
+        try:
+            if kind == "image_generate":
+                result = await image_generate(**params)
+            elif kind == "image_edit":
+                result = await image_edit(**params)
+            elif kind == "image_multi_reference":
+                result = await image_multi_reference(**params)
+            else:
+                raise ValueError(f"Unknown job kind: {kind}")
+            _JOBS[job_id]["status"] = "completed" if result.get("ok") else "failed"
+            _JOBS[job_id]["result"] = result
+            _JOBS[job_id]["error"] = result.get("error") or (result.get("errors") or [None])[0]
+        except Exception as e:  # noqa: BLE001
+            _JOBS[job_id]["status"] = "failed"
+            _JOBS[job_id]["error"] = str(e)
+            _JOBS[job_id]["traceback"] = traceback.format_exc(limit=5)
+        finally:
+            _JOBS[job_id]["updated_at"] = time.time()
+
+    asyncio.create_task(_runner())
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "running",
+        "kind": kind,
+        "message": "Image generation is running in the MCP server. Call image_job_status(job_id) to poll.",
+    }
+
+
 @mcp.tool()
 async def image_generate(
     prompt: str,
@@ -513,6 +551,71 @@ async def image_multi_reference(
         if any(token in msg.lower() for token in ("unsupported", "invalid", "input_image", "image_url")):
             msg = f"该接口暂不支持多图 input；原始错误: {msg}"
         return {"ok": False, "error": msg, "errors": [msg]}
+
+
+@mcp.tool()
+async def image_generate_async(
+    prompt: str,
+    size: str | None = "1024x1024",
+    n: int = 1,
+    model: str | None = None,
+    save_dir: str | None = None,
+    basename: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """Start text-to-image generation in the background and return a job_id immediately."""
+    return _start_job("image_generate", {
+        "prompt": prompt,
+        "size": size,
+        "n": n,
+        "model": model,
+        "save_dir": save_dir,
+        "basename": basename,
+        "api_key": api_key,
+    })
+
+
+@mcp.tool()
+async def image_edit_async(
+    prompt: str,
+    image_path: str,
+    mask_path: str | None = None,
+    size: str = "1024x1024",
+    model: str | None = None,
+    save_dir: str | None = None,
+    basename: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """Start image-reference generation in the background and return a job_id immediately."""
+    return _start_job("image_edit", {
+        "prompt": prompt,
+        "image_path": image_path,
+        "mask_path": mask_path,
+        "size": size,
+        "model": model,
+        "save_dir": save_dir,
+        "basename": basename,
+        "api_key": api_key,
+    })
+
+
+@mcp.tool()
+def image_job_status(job_id: str) -> dict[str, Any]:
+    """Poll a background image job created by image_generate_async or image_edit_async."""
+    job = _JOBS.get(job_id)
+    if not job:
+        return {"ok": False, "error": f"Unknown job_id: {job_id}"}
+    age_seconds = round(time.time() - job["created_at"], 1)
+    return {
+        "ok": job["status"] == "completed",
+        "job_id": job_id,
+        "kind": job["kind"],
+        "status": job["status"],
+        "age_seconds": age_seconds,
+        "updated_at": job["updated_at"],
+        "result": job["result"],
+        "error": job["error"],
+    }
 
 
 @mcp.tool()
