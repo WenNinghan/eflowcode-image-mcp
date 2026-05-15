@@ -1,0 +1,10 @@
+[mcp_servers.eflowcode-image]
+command = "python"
+args = ["path/to/eflowcode-image-mcp/server.py"]
+env = {
+  EFLOWCODE_API_KEY = "sk-your-key",
+  EFLOWCODE_BASE_URL = "https://e-flowcode.cc/v1",
+  EFLOWCODE_MODEL = "gpt-5.5",
+  EFLOWCODE_SAVE_DIR = "~/Pictures/eflowcode-image-out",
+  EFLOWCODE_SAVE_DIR_ROOT = "~/Pictures/eflowcode-image-out"
+}

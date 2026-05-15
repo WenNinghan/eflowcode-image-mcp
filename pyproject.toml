@@ -1,0 +1,30 @@
+[project]
+name = "eflowcode-image-mcp"
+version = "0.1.0"
+description = "MCP server for EFLOWCODE GPT-5.5 image generation via the Responses API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "WenNinghan" }
+]
+keywords = ["mcp", "image-generation", "responses-api", "eflowcode", "gpt-5.5"]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/WenNinghan/eflowcode-image-mcp"
+Repository = "https://github.com/WenNinghan/eflowcode-image-mcp"
+Issues = "https://github.com/WenNinghan/eflowcode-image-mcp/issues"
+
+[project.scripts]
+eflowcode-image-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]
