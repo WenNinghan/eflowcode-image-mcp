@@ -177,6 +177,10 @@ If no image result is found, the tool returns a clear error plus a compact respo
 - Input images are checked by magic bytes and size limits before upload.
 - Generated binary responses are capped before writing to disk.
 
+## Contributors
+
+- [zuoliangyu](https://github.com/zuoliangyu)
+
 ## License
 
 MIT
@@ -362,6 +366,10 @@ args = ["C:\\Users\\you\\eflowcode-image-mcp\\server.py"]
 - 输出路径会被限制在 `EFLOWCODE_SAVE_DIR_ROOT` 下
 - 上传前会校验输入图片的 magic bytes 和文件大小
 - 写入本地前会限制生成图片的响应大小
+
+## 贡献者
+
+- [zuoliangyu](https://github.com/zuoliangyu)
 
 ## 许可证
 
