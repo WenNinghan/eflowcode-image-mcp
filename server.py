@@ -415,11 +415,11 @@ def _start_job(kind: str, params: dict[str, Any]) -> dict[str, Any]:
     async def _runner() -> None:
         try:
             if kind == "image_generate":
-                result = await image_generate(**params)
+                result = await _image_generate_worker(**params)
             elif kind == "image_edit":
-                result = await image_edit(**params)
+                result = await _image_edit_worker(**params)
             elif kind == "image_multi_reference":
-                result = await image_multi_reference(**params)
+                result = await _image_multi_reference_worker(**params)
             else:
                 raise ValueError(f"Unknown job kind: {kind}")
             _JOBS[job_id]["status"] = "completed" if result.get("ok") else "failed"
@@ -442,6 +442,162 @@ def _start_job(kind: str, params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _image_generate_worker(
+    prompt: str,
+    size: str | None = "1024x1024",
+    n: int = 1,
+    model: str | None = None,
+    save_dir: str | None = None,
+    basename: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    err_n = _validate_n(n)
+    if err_n:
+        return {"ok": False, "error": err_n, "errors": [err_n]}
+    cleaned_size, out_dir, safe_stem, err = _validate_common(prompt, size, save_dir, basename)
+    if err:
+        return {"ok": False, "error": err, "errors": [err]}
+    key = _get_key(api_key)
+    stem = safe_stem or _default_basename("gen")
+
+    saved: list[dict[str, Any]] = []
+    errors: list[str] = []
+    summaries: list[dict[str, Any]] = []
+    for i in range(n):
+        try:
+            results, resp = await _responses_image_request(
+                key=key, prompt=prompt, size=cleaned_size, images=None, model=model
+            )
+            summaries.append(_response_summary(resp))
+            if not results:
+                errors.append(f"第 {i + 1} 张没有返回 image_generation_call.result: {_response_summary(resp)}")
+                continue
+            saved.append(_save_image_b64(results[0], out_dir, stem, i + 1 if n > 1 else None))  # type: ignore[arg-type]
+        except Exception as e:  # noqa: BLE001
+            errors.append(str(e))
+
+    return {
+        "ok": bool(saved),
+        "mode": "responses_image_generation",
+        "base_url": DEFAULT_BASEURL,
+        "model": model or DEFAULT_MODEL,
+        "size": cleaned_size,
+        "requested_n": n,
+        "saved": saved,
+        "errors": errors,
+        "notes": [
+            f"实际发送 prompt 以 {PROMPT_PREFIX!r} 开头",
+            "使用 /v1/responses + image_generation tool",
+        ],
+        "response_summaries": summaries,
+    }
+
+
+async def _image_edit_worker(
+    prompt: str,
+    image_path: str,
+    mask_path: str | None = None,
+    size: str = "1024x1024",
+    model: str | None = None,
+    save_dir: str | None = None,
+    basename: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    cleaned_size, out_dir, safe_stem, err = _validate_common(prompt, size, save_dir, basename, allow_size_none=False)
+    if err:
+        return {"ok": False, "error": err, "errors": [err]}
+    image, image_err = _validate_image_path(image_path)
+    if image_err:
+        return {"ok": False, "error": image_err, "errors": [image_err]}
+    notes = ["使用 Responses 多模态 input + image_generation"]
+    if mask_path:
+        notes.append("当前 Responses 模式不单独上传 alpha mask；mask_path 已忽略，需在 prompt 中描述编辑区域。")
+
+    try:
+        results, resp = await _responses_image_request(
+            key=_get_key(api_key),
+            prompt=f"基于输入图片进行编辑：{prompt}",
+            size=cleaned_size,
+            images=[image],  # type: ignore[list-item]
+            model=model,
+        )
+        if not results:
+            summary = _response_summary(resp)
+            return {"ok": False, "error": "没有返回 image_generation_call.result", "response_summary": summary}
+        saved = _save_image_b64(results[0], out_dir, safe_stem or _default_basename("edit"))  # type: ignore[arg-type]
+        return {
+            "ok": True,
+            "mode": "responses_image_generation",
+            "model": model or DEFAULT_MODEL,
+            "size": cleaned_size,
+            "saved": saved,
+            "notes": notes,
+            "response_summary": _response_summary(resp),
+        }
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if any(token in msg.lower() for token in ("unsupported", "invalid", "input_image", "image_url")):
+            msg = f"该接口暂不支持图像 input 或当前图片格式；原始错误: {msg}"
+        return {"ok": False, "error": msg, "errors": [msg], "notes": notes}
+
+
+async def _image_multi_reference_worker(
+    prompt: str,
+    image_paths: list[str],
+    size: str = "1024x1024",
+    model: str | None = None,
+    save_dir: str | None = None,
+    basename: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    cleaned_size, out_dir, safe_stem, err = _validate_common(prompt, size, save_dir, basename, allow_size_none=False)
+    if err:
+        return {"ok": False, "error": err, "errors": [err]}
+    if not isinstance(image_paths, list) or not 2 <= len(image_paths) <= MAX_N:
+        msg = f"image_paths 必须包含 2-{MAX_N} 张图片"
+        return {"ok": False, "error": msg, "errors": [msg]}
+
+    images: list[ImageInput] = []
+    total = 0
+    for idx, path in enumerate(image_paths, start=1):
+        image, image_err = _validate_image_path(path, f"image_paths[{idx}]")
+        if image_err:
+            return {"ok": False, "error": image_err, "errors": [image_err]}
+        total += len(image.raw)  # type: ignore[union-attr]
+        if total > MAX_TOTAL_INPUT_BYTES:
+            msg = f"参考图累计超过 {MAX_TOTAL_INPUT_BYTES // 1024 // 1024}MB"
+            return {"ok": False, "error": msg, "errors": [msg]}
+        images.append(image)  # type: ignore[arg-type]
+
+    try:
+        results, resp = await _responses_image_request(
+            key=_get_key(api_key),
+            prompt=f"综合这些参考图片生成一张新图：{prompt}",
+            size=cleaned_size,
+            images=images,
+            model=model,
+        )
+        if not results:
+            summary = _response_summary(resp)
+            return {"ok": False, "error": "没有返回 image_generation_call.result", "response_summary": summary}
+        saved = _save_image_b64(results[0], out_dir, safe_stem or _default_basename("multiref"))  # type: ignore[arg-type]
+        return {
+            "ok": True,
+            "mode": "responses_image_generation",
+            "model": model or DEFAULT_MODEL,
+            "n_references": len(images),
+            "size": cleaned_size,
+            "saved": saved,
+            "notes": ["使用 Responses 多图片 input + image_generation"],
+            "response_summary": _response_summary(resp),
+        }
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if any(token in msg.lower() for token in ("unsupported", "invalid", "input_image", "image_url")):
+            msg = f"该接口暂不支持多图 input；原始错误: {msg}"
+        return {"ok": False, "error": msg, "errors": [msg]}
+
+
 @mcp.tool()
 async def image_generate(
     prompt: str,
@@ -453,6 +609,12 @@ async def image_generate(
     api_key: str | None = None,
 ) -> dict[str, Any]:
     """文本生成图像。使用 gpt-5.5 /v1/responses + image_generation。"""
+    return {
+        "ok": False,
+        "error": "Synchronous image_generate is disabled to avoid Codex tool timeouts. Use image_generate_async, then poll image_job_status(job_id).",
+        "use_tool": "image_generate_async",
+        "poll_tool": "image_job_status",
+    }
     err_n = _validate_n(n)
     if err_n:
         return {"ok": False, "error": err_n, "errors": [err_n]}
@@ -507,6 +669,12 @@ async def image_edit(
     api_key: str | None = None,
 ) -> dict[str, Any]:
     """单图参考/编辑。把本地图片作为 Responses image input 传入 image_generation。"""
+    return {
+        "ok": False,
+        "error": "Synchronous image_edit is disabled to avoid Codex tool timeouts. Use image_edit_async, then poll image_job_status(job_id).",
+        "use_tool": "image_edit_async",
+        "poll_tool": "image_job_status",
+    }
     cleaned_size, out_dir, safe_stem, err = _validate_common(prompt, size, save_dir, basename, allow_size_none=False)
     if err:
         return {"ok": False, "error": err, "errors": [err]}
@@ -584,6 +752,12 @@ async def image_multi_reference(
     api_key: str | None = None,
 ) -> dict[str, Any]:
     """多图参考生成一张新图。把多张本地图片作为 Responses image input。"""
+    return {
+        "ok": False,
+        "error": "Synchronous image_multi_reference is disabled to avoid Codex tool timeouts. Use image_multi_reference_async, then poll image_job_status(job_id).",
+        "use_tool": "image_multi_reference_async",
+        "poll_tool": "image_job_status",
+    }
     cleaned_size, out_dir, safe_stem, err = _validate_common(prompt, size, save_dir, basename, allow_size_none=False)
     if err:
         return {"ok": False, "error": err, "errors": [err]}
@@ -670,6 +844,28 @@ async def image_edit_async(
         "prompt": prompt,
         "image_path": image_path,
         "mask_path": mask_path,
+        "size": size,
+        "model": model,
+        "save_dir": save_dir,
+        "basename": basename,
+        "api_key": api_key,
+    })
+
+
+@mcp.tool()
+async def image_multi_reference_async(
+    prompt: str,
+    image_paths: list[str],
+    size: str = "1024x1024",
+    model: str | None = None,
+    save_dir: str | None = None,
+    basename: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """Start multi-reference image generation in the background and return a job_id immediately."""
+    return _start_job("image_multi_reference", {
+        "prompt": prompt,
+        "image_paths": image_paths,
         "size": size,
         "model": model,
         "save_dir": save_dir,
